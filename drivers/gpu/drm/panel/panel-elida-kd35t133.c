@@ -109,6 +109,8 @@ static int kd35t133_unprepare(struct drm_panel *panel)
 	regulator_disable(ctx->iovcc);
 	regulator_disable(ctx->vdd);
 
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+
 	ctx->prepared = false;
 
 	return 0;

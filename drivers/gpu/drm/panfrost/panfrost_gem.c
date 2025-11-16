@@ -17,37 +17,12 @@
 static void panfrost_gem_free_object(struct drm_gem_object *obj)
 {
 	struct panfrost_gem_object *bo = to_panfrost_bo(obj);
-	struct panfrost_device *pfdev = obj->dev->dev_private;
-
-	/*
-	 * Make sure the BO is no longer inserted in the shrinker list before
-	 * taking care of the destruction itself. If we don't do that we have a
-	 * race condition between this function and what's done in
-	 * panfrost_gem_shrinker_scan().
-	 */
-	mutex_lock(&pfdev->shrinker_lock);
-	list_del_init(&bo->base.madv_list);
-	mutex_unlock(&pfdev->shrinker_lock);
 
 	/*
 	 * If we still have mappings attached to the BO, there's a problem in
 	 * our refcounting.
 	 */
 	WARN_ON_ONCE(!list_empty(&bo->mappings.list));
-
-	if (bo->sgts) {
-		int i;
-		int n_sgt = bo->base.base.size / SZ_2M;
-
-		for (i = 0; i < n_sgt; i++) {
-			if (bo->sgts[i].sgl) {
-				dma_unmap_sgtable(pfdev->dev, &bo->sgts[i],
-						  DMA_BIDIRECTIONAL, 0);
-				sg_free_table(&bo->sgts[i]);
-			}
-		}
-		kvfree(bo->sgts);
-	}
 
 	drm_gem_shmem_free(&bo->base);
 }
@@ -71,25 +46,50 @@ panfrost_gem_mapping_get(struct panfrost_gem_object *bo,
 	return mapping;
 }
 
-static void
-panfrost_gem_teardown_mapping(struct panfrost_gem_mapping *mapping)
+static void panfrost_gem_mapping_release(struct kref *kref)
 {
+	struct panfrost_gem_mapping *mapping =
+		container_of(kref, struct panfrost_gem_mapping, refcount);
+	struct panfrost_gem_object *bo = mapping->obj;
+	struct panfrost_device *pfdev = bo->base.base.dev->dev_private;
+
+	/* Shrinker may purge the mapping at the same time. */
+	dma_resv_lock(mapping->obj->base.base.resv, NULL);
 	if (mapping->active)
 		panfrost_mmu_unmap(mapping);
+	dma_resv_unlock(mapping->obj->base.base.resv);
 
 	spin_lock(&mapping->mmu->mm_lock);
 	if (drm_mm_node_allocated(&mapping->mmnode))
 		drm_mm_remove_node(&mapping->mmnode);
 	spin_unlock(&mapping->mmu->mm_lock);
-}
 
-static void panfrost_gem_mapping_release(struct kref *kref)
-{
-	struct panfrost_gem_mapping *mapping;
+	/* On heap BOs, release the sgts created in the fault handler path. */
+	if (bo->sgts) {
+		int i, n_sgt = bo->base.base.size / SZ_2M;
 
-	mapping = container_of(kref, struct panfrost_gem_mapping, refcount);
+		for (i = 0; i < n_sgt; i++) {
+			if (bo->sgts[i].sgl) {
+				dma_unmap_sgtable(pfdev->dev, &bo->sgts[i],
+						  DMA_BIDIRECTIONAL, 0);
+				sg_free_table(&bo->sgts[i]);
+			}
+		}
+		kvfree(bo->sgts);
+	}
 
-	panfrost_gem_teardown_mapping(mapping);
+	/* Pages ref is owned by the panfrost_gem_mapping object. We must
+	 * release our pages ref (if any), before releasing the object
+	 * ref.
+	 * Non-heap BOs acquired the pages at panfrost_gem_mapping creation
+	 * time, and heap BOs may have acquired pages if the fault handler
+	 * was called, in which case bo->sgts should be non-NULL.
+	 */
+	if (!bo->base.base.import_attach && (!bo->is_heap || bo->sgts)) {
+		drm_gem_shmem_put_pages(&bo->base);
+		bo->sgts = NULL;
+	}
+
 	drm_gem_object_put(&mapping->obj->base.base);
 	panfrost_mmu_ctx_put(mapping->mmu);
 	kfree(mapping);
@@ -103,12 +103,14 @@ void panfrost_gem_mapping_put(struct panfrost_gem_mapping *mapping)
 	kref_put(&mapping->refcount, panfrost_gem_mapping_release);
 }
 
-void panfrost_gem_teardown_mappings_locked(struct panfrost_gem_object *bo)
+void panfrost_gem_evict_mappings_locked(struct panfrost_gem_object *bo)
 {
 	struct panfrost_gem_mapping *mapping;
 
-	list_for_each_entry(mapping, &bo->mappings.list, node)
-		panfrost_gem_teardown_mapping(mapping);
+	list_for_each_entry(mapping, &bo->mappings.list, node) {
+		if (mapping->active)
+			panfrost_mmu_unmap(mapping);
+	}
 }
 
 int panfrost_gem_open(struct drm_gem_object *obj, struct drm_file *file_priv)
@@ -124,6 +126,20 @@ int panfrost_gem_open(struct drm_gem_object *obj, struct drm_file *file_priv)
 	mapping = kzalloc(sizeof(*mapping), GFP_KERNEL);
 	if (!mapping)
 		return -ENOMEM;
+
+	if (!bo->is_heap && !bo->base.base.import_attach) {
+		/* Pages ref is owned by the panfrost_gem_mapping object.
+		 * For non-heap BOs, we request pages at mapping creation
+		 * time, such that the panfrost_mmu_map() call, further down in
+		 * this function, is guaranteed to have pages_use_count > 0
+		 * when drm_gem_shmem_get_pages_sgt() is called.
+		 */
+		ret = drm_gem_shmem_get_pages(&bo->base);
+		if (ret) {
+			kfree(mapping);
+			return ret;
+		}
+	}
 
 	INIT_LIST_HEAD(&mapping->node);
 	kref_init(&mapping->refcount);
@@ -192,7 +208,7 @@ static int panfrost_gem_pin(struct drm_gem_object *obj)
 	if (bo->is_heap)
 		return -EINVAL;
 
-	return drm_gem_shmem_pin(&bo->base);
+	return drm_gem_shmem_object_pin(obj);
 }
 
 static enum drm_gem_object_status panfrost_gem_status(struct drm_gem_object *obj)
@@ -223,6 +239,25 @@ static size_t panfrost_gem_rss(struct drm_gem_object *obj)
 	return 0;
 }
 
+static int panfrost_shmem_evict(struct drm_gem_object *obj)
+{
+	struct panfrost_gem_object *bo = to_panfrost_bo(obj);
+
+	if (!drm_gem_shmem_is_purgeable(&bo->base))
+		return -EBUSY;
+
+	if (!mutex_trylock(&bo->mappings.lock))
+		return -EBUSY;
+
+	panfrost_gem_evict_mappings_locked(bo);
+
+	drm_gem_shmem_purge_locked(&bo->base);
+
+	mutex_unlock(&bo->mappings.lock);
+
+	return 0;
+}
+
 static const struct drm_gem_object_funcs panfrost_gem_funcs = {
 	.free = panfrost_gem_free_object,
 	.open = panfrost_gem_open,
@@ -237,6 +272,7 @@ static const struct drm_gem_object_funcs panfrost_gem_funcs = {
 	.status = panfrost_gem_status,
 	.rss = panfrost_gem_rss,
 	.vm_ops = &drm_gem_shmem_vm_ops,
+	.evict = panfrost_shmem_evict,
 };
 
 /**

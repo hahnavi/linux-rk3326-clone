@@ -147,8 +147,18 @@ void virtio_gpu_gem_object_close(struct drm_gem_object *obj,
 	struct virtio_gpu_device *vgdev = obj->dev->dev_private;
 	struct virtio_gpu_fpriv *vfpriv = file->driver_priv;
 	struct virtio_gpu_object_array *objs;
+	struct virtio_gpu_object *bo;
 
 	if (!vgdev->has_virgl_3d)
+		return;
+
+	bo = gem_to_virtio_gpu_obj(obj);
+
+	/*
+	 * Purged BO was already detached and released, the resource ID
+	 * is invalid by now.
+	 */
+	if (!virtio_gpu_gem_madvise(bo, VIRTGPU_MADV_WILLNEED))
 		return;
 
 	objs = virtio_gpu_array_alloc(1);
@@ -293,4 +303,79 @@ void virtio_gpu_array_put_free_work(struct work_struct *work)
 		spin_lock(&vgdev->obj_free_lock);
 	}
 	spin_unlock(&vgdev->obj_free_lock);
+}
+
+int virtio_gpu_array_prepare(struct virtio_gpu_device *vgdev,
+			     struct virtio_gpu_object_array *objs)
+{
+	struct virtio_gpu_object *bo;
+	int ret = 0;
+	u32 i;
+
+	for (i = 0; i < objs->nents; i++) {
+		bo = gem_to_virtio_gpu_obj(objs->objs[i]);
+
+		if (virtio_gpu_is_shmem(bo)) {
+			if (bo->base.madv)
+				return -EINVAL;
+
+			if (bo->detached) {
+				ret = virtio_gpu_reattach_shmem_object_locked(bo);
+				if (ret)
+					break;
+			}
+		}
+	}
+
+	return ret;
+}
+
+int virtio_gpu_gem_madvise(struct virtio_gpu_object *bo, int madv)
+{
+	if (virtio_gpu_is_shmem(bo))
+		return drm_gem_shmem_object_madvise(&bo->base.base, madv);
+
+	return 1;
+}
+
+int virtio_gpu_gem_host_mem_release(struct virtio_gpu_object *bo)
+{
+	struct virtio_gpu_device *vgdev = bo->base.base.dev->dev_private;
+	int err;
+
+	if (bo->created) {
+		err = virtio_gpu_cmd_release_resource(vgdev, bo);
+		if (err)
+			return err;
+
+		virtio_gpu_notify(vgdev);
+		bo->created = false;
+	}
+
+	return 0;
+}
+
+int virtio_gpu_gem_pin(struct virtio_gpu_object *bo)
+{
+	int err;
+
+	if (virtio_gpu_is_shmem(bo)) {
+		err = drm_gem_shmem_pin(&bo->base);
+		if (err)
+			return err;
+
+		err = virtio_gpu_reattach_shmem_object(bo);
+		if (err) {
+			drm_gem_shmem_unpin(&bo->base);
+			return err;
+		}
+	}
+
+	return 0;
+}
+
+void virtio_gpu_gem_unpin(struct virtio_gpu_object *bo)
+{
+	if (virtio_gpu_is_shmem(bo))
+		drm_gem_shmem_unpin(&bo->base);
 }
