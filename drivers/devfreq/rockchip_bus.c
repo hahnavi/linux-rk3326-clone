@@ -198,7 +198,7 @@ static int rockchip_bus_clkfreq(struct rockchip_bus *bus)
 	}
 
 	init_rate = clk_get_rate(bus->clk);
-	printk("init rate %d", init_rate);
+	printk("init rate %lu", init_rate);
 	ret = rockchip_bus_clkfreq_target(dev, init_rate);
 	if (ret)
 		return ret;
@@ -228,10 +228,7 @@ MODULE_DEVICE_TABLE(of, rockchip_busfreq_of_match);
 static int rockchip_busfreq_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct device_node *np = dev->of_node;
 	struct rockchip_bus *bus;
-	const char *policy_name;
-	int ret = 0;
 
 	bus = devm_kzalloc(dev, sizeof(*bus), GFP_KERNEL);
 	if (!bus)

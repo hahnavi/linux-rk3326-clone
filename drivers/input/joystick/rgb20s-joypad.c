@@ -571,7 +571,7 @@ static ssize_t joypad_show_period(struct device *dev,
 	struct platform_device *pdev  = to_platform_device(dev);
 	struct joypad *joypad = platform_get_drvdata(pdev);
 
-	return sprintf(buf, "%d\n", pwm_get_period(joypad->pwm));
+	return sprintf(buf, "%llu\n", pwm_get_period(joypad->pwm));
 }
 
 /*----------------------------------------------------------------------------*/
